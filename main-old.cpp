@@ -32,9 +32,6 @@
  *   - No camera calibration: wide-angle glass lenses distort geometry.
  *   - Tracking is 2D image-space; very fast rotation may drop IDs briefly.
  *   - Physics = flat table, frictionless ghost-ball model.
- *   - Colour IDs use Lab+HSV prototypes, specular/felt masking, CLAHE WB,
- *     stripe detection ("/s"), and temporal label locking — still lighting-
- *     dependent; re-open camera / reset tracker after big light changes.
  *   - No Q_OBJECT macros on purpose -> the file needs no moc step.
  * ==========================================================================*/
 
@@ -71,7 +68,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <map>
 #include <string>
 #include <vector>
 
@@ -114,304 +110,22 @@ static void inRangeHue(const cv::Mat &hsv, int hLo, int hHi,
     }
 }
 
-/* ---- colour-classifier support ----------------------------------------- */
-
-enum BallColor {
-    BC_CUE = 0, BC_YELLOW, BC_BLUE, BC_RED, BC_PURPLE,
-    BC_ORANGE, BC_GREEN, BC_MAROON, BC_BLACK, BC_UNKNOWN, BC_COUNT
-};
-
-static const char *ballColorName(BallColor c)
-{
-    static const char *n[] = {
-        "CUE","YELLOW","BLUE","RED","PURPLE","ORANGE","GREEN","MAROON","BLACK","?"
-    };
-    int i = (int)c;
-    if (i < 0 || i >= (int)BC_COUNT) i = (int)BC_UNKNOWN;
-    return n[i];
-}
-
-static cv::Scalar ballColorBgr(BallColor c)
+/* Rough pool-ball colour naming from average HSV. */
+static void classifyHsv(const cv::Vec3b &c, std::string &label,
+                        bool &isCue, cv::Scalar &bgr)
 {
     using cv::Scalar;
-    switch (c) {
-    case BC_CUE:    return Scalar(255,255,255);
-    case BC_YELLOW: return Scalar( 40,220,255);
-    case BC_BLUE:   return Scalar(230,120, 40);
-    case BC_RED:    return Scalar( 40, 40,230);
-    case BC_PURPLE: return Scalar(200, 60,160);
-    case BC_ORANGE: return Scalar( 30,140,255);
-    case BC_GREEN:  return Scalar( 60,200, 60);
-    case BC_MAROON: return Scalar( 40, 40,140);
-    case BC_BLACK:  return Scalar( 30, 30, 30);
-    default:        return Scalar(160,160,160);
-    }
-}
-
-struct ColorSample {
-    cv::Vec3b hsv = cv::Vec3b(0, 0, 0);
-    cv::Vec3f lab = cv::Vec3f(0, 0, 0);   // OpenCV Lab: L 0..255, a/b 0..255 (128=neutral)
-    float     chroma = 0.f;              // sqrt(a'^2 + b'^2) with a'=a-128
-    float     whiteFrac = 0.f;
-    float     darkFrac = 0.f;
-    float     chromaFrac = 0.f;
-    int       nValid = 0;
-    bool      ok = false;
-};
-
-/* CLAHE on L + mild gray-world WB using felt pixels — reduces glare / uneven light. */
-static void correctIllumination(cv::Mat &bgr, const cv::Mat &tableMask)
-{
-    using namespace cv;
-    if (bgr.empty()) return;
-
-    /* Gray-world scale from felt only (skip if mask tiny). */
-    if (!tableMask.empty() && countNonZero(tableMask) > 2000) {
-        Scalar m = mean(bgr, tableMask);
-        double g = (m[0] + m[1] + m[2]) / 3.0;
-        if (g > 8.0) {
-            Mat ch[3];
-            split(bgr, ch);
-            for (int i = 0; i < 3; ++i) {
-                double s = g / std::max(1.0, m[i]);
-                s = std::max(0.75, std::min(1.35, s));   // clamp — felt is green, not gray
-                ch[i].convertTo(ch[i], -1, s, 0);
-            }
-            merge(ch, 3, bgr);
-        }
-    }
-
-    Mat lab;
-    cvtColor(bgr, lab, COLOR_BGR2Lab);
-    std::vector<Mat> planes;
-    split(lab, planes);
-    Ptr<CLAHE> clahe = createCLAHE(2.2, Size(8, 8));
-    clahe->apply(planes[0], planes[0]);
-    merge(planes, lab);
-    cvtColor(lab, bgr, COLOR_Lab2BGR);
-}
-
-static float hueDist(float a, float b)
-{
-    float d = std::fabs(a - b);
-    return std::min(d, 180.f - d);
-}
-
-/* Robust interior sample: ring mask, drop specular / shadow / felt bleed. */
-static ColorSample sampleBallColor(const cv::Mat &hsv, const cv::Mat &lab,
-                                   cv::Point2f c, float r,
-                                   float feltH, bool haveFelt)
-{
-    using namespace cv;
-    ColorSample out;
-    if (hsv.empty() || lab.empty() || r < 3.f) return out;
-
-    int x0 = std::max(0, (int)std::floor(c.x - r - 1));
-    int y0 = std::max(0, (int)std::floor(c.y - r - 1));
-    int x1 = std::min(hsv.cols - 1, (int)std::ceil(c.x + r + 1));
-    int y1 = std::min(hsv.rows - 1, (int)std::ceil(c.y + r + 1));
-    if (x1 - x0 < 3 || y1 - y0 < 3) return out;
-
-    const float rIn  = r * 0.22f;
-    const float rOut = r * 0.70f;
-    std::vector<float> Hs, Ss, Vs, Ls, As, Bs;
-    int nWhite = 0, nDark = 0, nChroma = 0, nAll = 0;
-
-    for (int y = y0; y <= y1; ++y) {
-        const Vec3b *ph = hsv.ptr<Vec3b>(y);
-        const Vec3b *pl = lab.ptr<Vec3b>(y);
-        for (int x = x0; x <= x1; ++x) {
-            float dx = x - c.x, dy = y - c.y;
-            float d2 = dx * dx + dy * dy;
-            if (d2 < rIn * rIn || d2 > rOut * rOut) continue;
-            ++nAll;
-
-            const Vec3b &hv = ph[x];
-            int H = hv[0], S = hv[1], V = hv[2];
-
-            /* Specular glint on shiny balls → washes every colour toward white. */
-            if (V >= 230 && S <= 50) { ++nWhite; continue; }
-            /* Deep shadow / number pit. */
-            if (V <= 28) { ++nDark; continue; }
-
-            float dist = std::sqrt(d2);
-            if (haveFelt && dist > r * 0.52f && S >= 40 &&
-                hueDist((float)H, feltH) < 14.f) {
-                continue;   /* felt bleed at the rim */
-            }
-
-            if (S <= 55 && V >= 155) ++nWhite;
-            else if (V <= 55)        ++nDark;
-            if (S >= 70 && V >= 55)  ++nChroma;
-
-            /* Keep mid-tone chromatic + dark solids; skip near-white for mean hue. */
-            if (S < 35 && V > 170) continue;
-
-            const Vec3b &lv = pl[x];
-            Hs.push_back((float)H);
-            Ss.push_back((float)S);
-            Vs.push_back((float)V);
-            Ls.push_back((float)lv[0]);
-            As.push_back((float)lv[1]);
-            Bs.push_back((float)lv[2]);
-        }
-    }
-
-    if (nAll > 0) {
-        out.whiteFrac  = (float)nWhite  / nAll;
-        out.darkFrac   = (float)nDark   / nAll;
-        out.chromaFrac = (float)nChroma / nAll;
-    }
-
-    if (Hs.size() < 8) {
-        /* Fallback: small mean of full disc if ring was too sparse (tiny balls). */
-        Rect bb(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
-        Mat rm = Mat::zeros(bb.size(), CV_8U);
-        circle(rm, c - Point2f((float)bb.x, (float)bb.y),
-               std::max(2, (int)(r * 0.55f)), Scalar(255), -1);
-        Scalar mh = mean(hsv(bb), rm);
-        Scalar ml = mean(lab(bb), rm);
-        out.hsv = Vec3b(saturate_cast<uchar>(mh[0]),
-                        saturate_cast<uchar>(mh[1]),
-                        saturate_cast<uchar>(mh[2]));
-        out.lab = Vec3f((float)ml[0], (float)ml[1], (float)ml[2]);
-        float aa = out.lab[1] - 128.f, bbv = out.lab[2] - 128.f;
-        out.chroma = std::sqrt(aa * aa + bbv * bbv);
-        out.nValid = (int)Hs.size();
-        out.ok = true;
-        return out;
-    }
-
-    auto med = [](std::vector<float> &v) -> float {
-        size_t n = v.size() / 2;
-        std::nth_element(v.begin(), v.begin() + n, v.end());
-        return v[n];
-    };
-
-    /* Hue median with wrap: project near-red samples into contiguous space. */
-    float h0 = med(Hs);
-    std::vector<float> Hu = Hs;
-    for (float &h : Hu) {
-        if (h0 < 20.f && h > 100.f) h -= 180.f;
-        if (h0 > 160.f && h < 80.f) h += 180.f;
-    }
-    float hMed = med(Hu);
-    if (hMed < 0.f) hMed += 180.f;
-    if (hMed >= 180.f) hMed -= 180.f;
-
-    float sMed = med(Ss), vMed = med(Vs);
-    float lMed = med(Ls), aMed = med(As), bMed = med(Bs);
-
-    out.hsv = Vec3b(saturate_cast<uchar>(hMed),
-                    saturate_cast<uchar>(sMed),
-                    saturate_cast<uchar>(vMed));
-    out.lab = Vec3f(lMed, aMed, bMed);
-    float aa = aMed - 128.f, bbv = bMed - 128.f;
-    out.chroma = std::sqrt(aa * aa + bbv * bbv);
-    out.nValid = (int)Hs.size();
-    out.ok = true;
-    return out;
-}
-
-/* Lab a*b* prototypes (OpenCV 0..255, neutral at 128) + HSV tie-break. */
-static BallColor classifyColorSample(const ColorSample &s, bool &isStripe)
-{
-    isStripe = false;
-    if (!s.ok) return BC_UNKNOWN;
-
-    const float L = s.lab[0];
-    const float a = s.lab[1] - 128.f;
-    const float b = s.lab[2] - 128.f;
-    const int H = s.hsv[0], S = s.hsv[1], V = s.hsv[2];
-
-    /* Cue / black first — chroma + value dominate over hue. */
-    if (s.chroma < 18.f && L >= 155.f && S <= 70) return BC_CUE;
-    if (s.whiteFrac > 0.55f && s.chromaFrac < 0.20f && L >= 140.f) return BC_CUE;
-    if (L <= 55.f && s.chroma < 22.f) return BC_BLACK;
-    if (V <= 70 && S <= 90 && s.chroma < 28.f) return BC_BLACK;
-
-    /* Stripe: notable white band + chromatic body. */
-    isStripe = (s.whiteFrac >= 0.16f && s.chromaFrac >= 0.22f && s.chroma > 20.f);
-
-    struct Proto { BallColor id; float aa, bb, L; float h; };
-    /* Tuned for typical billiard plastics under warm room light. */
-    static const Proto protos[] = {
-        { BC_YELLOW, -12.f,  62.f, 180.f,  28.f },
-        { BC_ORANGE,  38.f,  52.f, 150.f,  14.f },
-        { BC_RED,     52.f,  28.f, 110.f,   2.f },
-        { BC_MAROON,  32.f,  12.f,  75.f,   0.f },
-        { BC_PURPLE,  28.f, -32.f, 100.f, 145.f },
-        { BC_BLUE,    12.f, -48.f, 110.f, 110.f },
-        { BC_GREEN,  -42.f,  38.f, 120.f,  55.f },
-    };
-
-    float best = 1e9f; BallColor bestId = BC_UNKNOWN;
-    for (const auto &p : protos) {
-        float da = a - p.aa, db = b - p.bb, dL = (L - p.L) * 0.25f;
-        float dLab = da * da + db * db + dL * dL;
-        float dH = hueDist((float)H, p.h);
-        /* Soft HSV vote — helps orange/yellow and red/maroon under weird WB. */
-        float cost = dLab + 0.35f * dH * dH;
-        if (S < 50) cost += 80.f;   /* desaturated → less trust in hue protos */
-        if (cost < best) { best = cost; bestId = p.id; }
-    }
-
-    /* HSV hard overrides when Lab is ambiguous near warm hues. */
-    if (S >= 70 && V >= 60) {
-        if (H <= 6 || H >= 170) {
-            if (V < 100 || L < 95.f) bestId = BC_MAROON;
-            else bestId = BC_RED;
-        } else if (H < 18) {
-            /* Orange lives here; do NOT promote bright samples to yellow. */
-            bestId = BC_ORANGE;
-            /* Only very high-L + low a* at the yellow edge → yellow. */
-            if (H >= 15 && L > 190.f && a < 18.f) bestId = BC_YELLOW;
-        } else if (H < 24) {
-            /* Yellow/orange border — Lab a* separates them. */
-            bestId = (a > 28.f || L < 155.f) ? BC_ORANGE : BC_YELLOW;
-        } else if (H < 38) {
-            bestId = BC_YELLOW;
-        } else if (H < 88) {
-            bestId = BC_GREEN;
-        } else if (H < 128) {
-            bestId = BC_BLUE;
-        } else if (H < 165) {
-            bestId = BC_PURPLE;
-        }
-    }
-
-    if (bestId == BC_UNKNOWN && S < 55) {
-        if (L >= 150.f) return BC_CUE;
-        if (L <= 70.f)  return BC_BLACK;
-    }
-    return bestId;
-}
-
-static void classifyBall(const ColorSample &s, std::string &label,
-                         bool &isCue, cv::Scalar &drawBgr, bool &stripe)
-{
-    BallColor c = classifyColorSample(s, stripe);
-    isCue = (c == BC_CUE);
-    drawBgr = ballColorBgr(c);
-    if (c == BC_CUE || c == BC_BLACK || c == BC_UNKNOWN || !stripe)
-        label = ballColorName(c);
-    else {
-        label = std::string(ballColorName(c)) + "/s";
-    }
-}
-
-/* Majority vote over a short history — stops frame-to-frame label flicker. */
-static std::string voteLabel(std::vector<std::string> &hist, const std::string &cur,
-                             int maxHist = 9)
-{
-    hist.push_back(cur);
-    if ((int)hist.size() > maxHist) hist.erase(hist.begin());
-    std::map<std::string, int> cnt;
-    for (const auto &s : hist) ++cnt[s];
-    std::string best = cur; int bc = 0;
-    for (const auto &kv : cnt)
-        if (kv.second > bc) { bc = kv.second; best = kv.first; }
-    return best;
+    int h = c[0], s = c[1], v = c[2];
+    isCue = false;
+    if (v >= 165 && s <= 70) { label = "CUE";   isCue = true; bgr = Scalar(255,255,255); return; }
+    if (v <= 80)             { label = "BLACK";                 bgr = Scalar( 30, 30, 30); return; }
+    if (s < 60)              { label = "GREY";                  bgr = Scalar(160,160,160); return; }
+    if (h < 8 || h >= 172)   { label = "RED";                   bgr = Scalar( 40, 40,230); }
+    else if (h < 20)         { label = "ORANGE";                bgr = Scalar( 30,140,255); }
+    else if (h < 34)         { label = "YELLOW";                bgr = Scalar( 40,220,255); }
+    else if (h < 80)         { label = "GREEN";                 bgr = Scalar( 60,200, 60); }
+    else if (h < 130)        { label = "BLUE";                  bgr = Scalar(230,120, 40); }
+    else                     { label = "PURPLE";                bgr = Scalar(200, 60,160); }
 }
 
 static cv::Point2f extendToRect(const cv::Point2f &o, const cv::Point2f &d,
@@ -472,11 +186,9 @@ struct BallDet
 {
     cv::Point2f c;  float r = 0;  float fill = 0;
     cv::Vec3b   hsv;
-    ColorSample sample;
     std::string label;
     cv::Scalar  bgr;
     bool        isCue = false;
-    bool        isStripe = false;
 };
 
 struct BallTrack
@@ -485,16 +197,10 @@ struct BallTrack
     cv::Point2f pos, vel;            // px, px/frame
     float       radius = 10.f;
     float       hE = 0, sE = 0, vE = 0;   // EMA of HSV
-    float       lE = 0, aE = 0, bE = 0;   // EMA of Lab
-    float       whiteFracE = 0, chromaFracE = 0;
     std::string label = "?";
     cv::Scalar  bgr = cv::Scalar(200, 200, 200);
     bool        isCue = false;
-    bool        isStripe = false;
     int         hits = 0, misses = 0;
-    int         lockHits = 0;             // consecutive same voted label
-    std::string lockedLabel;
-    std::vector<std::string> labelHist;
     bool confirmed() const { return hits >= 2; }
 };
 
@@ -521,8 +227,6 @@ struct Analysis
     std::vector<cv::Point>     tableContour;
     cv::Point2f                tableCenter;
     cv::Point2f                shift;        // estimated head motion / frame
-    float                      feltHue = 55.f;
-    bool                       haveFeltHue = false;
     std::vector<BallDet>       ballDets;
     std::vector<BallTrack>     tracks;
     int                        cueBallIdx = -1;
@@ -543,7 +247,7 @@ public:
 private:
     void detectTable(const cv::Mat &hsv, Analysis &A);
     cv::Point2f estimateMotion(const cv::Mat &gray, const cv::Mat &mask);
-    void detectBalls(const cv::Mat &hsv, const cv::Mat &lab, Analysis &A, const Params &p);
+    void detectBalls(const cv::Mat &hsv, Analysis &A, const Params &p);
     void updateTracks(Analysis &A, cv::Point2f shift);
     void detectCue(const cv::Mat &blur, const cv::Mat &hsv,
                    Analysis &A, const Params &p);
@@ -564,7 +268,7 @@ void PoolEngine::process(const cv::Mat &frameIn, const Params &p, Analysis &A)
     using namespace cv;
     if (frameIn.empty()) return;
 
-    Mat frame = frameIn.clone();
+    Mat frame = frameIn;
     if (p.flip) flip(frame, frame, 1);
     if (frame.cols > p.maxWidth) {
         double s = (double)p.maxWidth / frame.cols;
@@ -572,23 +276,14 @@ void PoolEngine::process(const cv::Mat &frameIn, const Params &p, Analysis &A)
     }
     A.frame = frame;
 
-    Mat gray, blur, hsv, lab;
+    Mat gray, blur, hsv;
     cvtColor(frame, gray, COLOR_BGR2GRAY);
     GaussianBlur(gray, blur, Size(5, 5), 1.1);
+    cvtColor(frame, hsv, COLOR_BGR2HSV);
 
-    /* Felt first (on raw frame), then illuminate-correct for colour work. */
-    {
-        Mat hsvRaw;
-        cvtColor(frame, hsvRaw, COLOR_BGR2HSV);
-        detectTable(hsvRaw, A);
-    }
-    Mat corrected = frame.clone();
-    correctIllumination(corrected, A.tableMask);
-    cvtColor(corrected, hsv, COLOR_BGR2HSV);
-    cvtColor(corrected, lab, COLOR_BGR2Lab);
-
+    detectTable(hsv, A);                       // felt region
     A.shift = estimateMotion(gray, A.tableMask); // head movement compensation
-    detectBalls(hsv, lab, A, p);               // per-frame ball candidates
+    detectBalls(hsv, A, p);                    // per-frame ball candidates
     updateTracks(A, A.shift);                  // persistent IDs
     A.tracks = tracks;
 
@@ -632,20 +327,10 @@ void PoolEngine::detectTable(const cv::Mat &hsv, Analysis &A)
         A.tableCenter = (mu.m00 > 0)
             ? Point2f((float)(mu.m10 / mu.m00), (float)(mu.m01 / mu.m00))
             : Point2f(m.cols / 2.f, m.rows / 2.f);
-        Mat feltCore;
-        erode(A.tableMask, feltCore, getStructuringElement(MORPH_ELLIPSE, Size(21, 21)));
-        if (countNonZero(feltCore) > 500) {
-            Scalar fm = mean(hsv, feltCore);
-            A.feltHue = (float)fm[0];
-            A.haveFeltHue = true;
-        } else {
-            A.haveFeltHue = false;
-        }
     } else {
         A.tableMask = Mat(m.size(), CV_8U, Scalar(255)); // fallback: whole frame
         A.tableContour.clear();
         A.tableCenter = Point2f(m.cols / 2.f, m.rows / 2.f);
-        A.haveFeltHue = false;
     }
     dilate(A.tableMask, A.tableMaskD, getStructuringElement(MORPH_ELLIPSE, Size(25,25)));
 }
@@ -680,35 +365,14 @@ cv::Point2f PoolEngine::estimateMotion(const cv::Mat &gray, const cv::Mat &mask)
 }
 
 /* ---- per-frame ball candidates ------------------------------------------ */
-void PoolEngine::detectBalls(const cv::Mat &hsv, const cv::Mat &lab,
-                             Analysis &A, const Params &p)
+void PoolEngine::detectBalls(const cv::Mat &hsv, Analysis &A, const Params &p)
 {
     using namespace cv;
     Mat white, colored, dark, m;
-    /* Slightly looser white / tighter dark so cue & 8-ball survive WB. */
-    inRange(hsv, Scalar(0,   0, 155), Scalar(180,  80, 255), white);  // cue ball
-    inRange(hsv, Scalar(0,  70,  55), Scalar(180, 255, 255), colored);// object balls
-    inRange(hsv, Scalar(0,   0,  10), Scalar(180, 180,  85), dark);   // 8-ball
+    inRange(hsv, Scalar(0,   0, 170), Scalar(180,  65, 255), white);  // cue ball
+    inRange(hsv, Scalar(0,  95,  80), Scalar(180, 255, 255), colored);// object balls
+    inRange(hsv, Scalar(0,   0,  15), Scalar(180, 170,  80), dark);   // 8-ball
     m = white | colored | dark;
-
-    /* Lab distance from felt — catches green balls whose hue overlaps cloth. */
-    if (!A.tableMask.empty() && !lab.empty()) {
-        Mat feltCore;
-        erode(A.tableMask, feltCore, getStructuringElement(MORPH_ELLIPSE, Size(25, 25)));
-        if (countNonZero(feltCore) > 800) {
-            Scalar fm = mean(lab, feltCore);
-            Mat f32; lab.convertTo(f32, CV_32FC3);
-            std::vector<Mat> ch; split(f32, ch);
-            Mat da = ch[1] - (float)fm[1], db = ch[2] - (float)fm[2];
-            Mat dL = ch[0] - (float)fm[0];
-            Mat dist;
-            sqrt(da.mul(da) + db.mul(db) + 0.15f * dL.mul(dL), dist);
-            Mat far;
-            inRange(dist, 14.0, 200.0, far);
-            m |= (far & A.tableMaskD);
-        }
-    }
-
     if (!A.tableMaskD.empty()) m = m & A.tableMaskD;
 
     morphologyEx(m, m, MORPH_OPEN,  getStructuringElement(MORPH_RECT,    Size(3,3)));
@@ -720,40 +384,30 @@ void PoolEngine::detectBalls(const cv::Mat &hsv, const cv::Mat &lab,
     float rmin = p.minBallR, rmax = p.minBallR * 3.4f;
     std::vector<BallDet> dets;
 
-    auto tryAdd = [&](Point2f cc, float r, double fill) {
-        if (r < rmin || r > rmax) return;
-        if (fill < 0.48 || fill > 1.15) return;
-        ColorSample samp = sampleBallColor(hsv, lab, cc, r, A.feltHue, A.haveFeltHue);
-        if (!samp.ok) return;
-        BallDet d;
-        d.c = cc; d.r = r; d.fill = (float)fill;
-        d.hsv = samp.hsv;
-        d.sample = samp;
-        classifyBall(samp, d.label, d.isCue, d.bgr, d.isStripe);
-        dets.push_back(d);
-    };
-
     for (const auto &c : cs) {
         double area = contourArea(c);
         if (area < 20) continue;
         Point2f cc; float r;
         minEnclosingCircle(c, cc, r);
+        if (r < rmin || r > rmax) continue;
         double fill = area / (CV_PI * r * r);
-        tryAdd(cc, r, fill);
-    }
+        if (fill < 0.52 || fill > 1.10) continue;   // roundness gate
 
-    /* Hough circles as a second pass — helps when colour blends with felt. */
-    if (!A.frame.empty()) {
-        Mat gray;
-        cvtColor(A.frame, gray, COLOR_BGR2GRAY);
-        GaussianBlur(gray, gray, Size(7, 7), 1.4);
-        if (!A.tableMaskD.empty()) gray.setTo(0, ~A.tableMaskD);
-        std::vector<Vec3f> circles;
-        HoughCircles(gray, circles, HOUGH_GRADIENT, 1.3,
-                     std::max(rmin * 1.8f, 12.f),
-                     110, 18, (int)rmin, (int)rmax);
-        for (const auto &cir : circles)
-            tryAdd(Point2f(cir[0], cir[1]), cir[2], 0.85);
+        /* sample average HSV inside the blob for classification */
+        Rect bb = boundingRect(c) & Rect(0, 0, hsv.cols, hsv.rows);
+        if (bb.width < 4 || bb.height < 4) continue;
+        Mat rm = Mat::zeros(bb.size(), CV_8U);
+        circle(rm, cc - Point2f((float)bb.x, (float)bb.y),
+               std::max(2, (int)(r * 0.55f)), Scalar(255), -1);
+        Scalar mh = mean(hsv(bb), rm);
+
+        BallDet d;
+        d.c = cc; d.r = r; d.fill = (float)fill;
+        d.hsv = Vec3b(saturate_cast<uchar>(mh[0]),
+                      saturate_cast<uchar>(mh[1]),
+                      saturate_cast<uchar>(mh[2]));
+        classifyHsv(d.hsv, d.label, d.isCue, d.bgr);
+        dets.push_back(d);
     }
 
     /* NMS — keep the roundest when blobs overlap */
@@ -762,7 +416,7 @@ void PoolEngine::detectBalls(const cv::Mat &hsv, const cv::Mat &lab,
     for (const auto &d : dets) {
         bool dup = false;
         for (const auto &k : A.ballDets)
-            if (norm(d.c - k.c) < 0.7f * (d.r + k.r)) { dup = true; break; }
+            if (norm(d.c - k.c) < 07.0f / 10.f * (d.r + k.r)) { dup = true; break; }
         if (!dup) A.ballDets.push_back(d);
     }
 }
@@ -800,75 +454,13 @@ void PoolEngine::updateTracks(Analysis &A, cv::Point2f shift)
         tk.radius = 0.7f  * tk.radius + 0.3f * dt.r;
 
         float dh = dt.hsv[0] - tk.hE;                  // hue wrap guard
-        if (std::fabs(dh) < 90.f) tk.hE = 0.75f * tk.hE + 0.25f * dt.hsv[0];
-        tk.sE = 0.75f * tk.sE + 0.25f * dt.hsv[1];
-        tk.vE = 0.75f * tk.vE + 0.25f * dt.hsv[2];
-        if (dt.sample.ok) {
-            tk.lE = 0.75f * tk.lE + 0.25f * dt.sample.lab[0];
-            tk.aE = 0.75f * tk.aE + 0.25f * dt.sample.lab[1];
-            tk.bE = 0.75f * tk.bE + 0.25f * dt.sample.lab[2];
-            tk.whiteFracE  = 0.75f * tk.whiteFracE  + 0.25f * dt.sample.whiteFrac;
-            tk.chromaFracE = 0.75f * tk.chromaFracE + 0.25f * dt.sample.chromaFrac;
-        }
+        if (std::fabs(dh) < 90.f) tk.hE = 0.7f * tk.hE + 0.3f * dt.hsv[0];
+        tk.sE = 0.7f * tk.sE + 0.3f * dt.hsv[1];
+        tk.vE = 0.7f * tk.vE + 0.3f * dt.hsv[2];
 
-        /* Re-classify from EMA state (more stable than single-frame). */
-        ColorSample ema = dt.sample;
-        ema.ok = true;
-        ema.hsv = Vec3b(
-            (uchar)std::max(0.f, std::min(255.f, tk.hE)),
-            (uchar)std::max(0.f, std::min(255.f, tk.sE)),
-            (uchar)std::max(0.f, std::min(255.f, tk.vE)));
-        ema.lab = Vec3f(tk.lE, tk.aE, tk.bE);
-        float aa = tk.aE - 128.f, bbv = tk.bE - 128.f;
-        ema.chroma = std::sqrt(aa * aa + bbv * bbv);
-        ema.whiteFrac = tk.whiteFracE;
-        ema.chromaFrac = tk.chromaFracE;
-
-        std::string rawLabel;
-        bool stripe = false;
-        cv::Scalar drawBgr;
-        bool isCue = false;
-        classifyBall(ema, rawLabel, isCue, drawBgr, stripe);
-
-        std::string voted = voteLabel(tk.labelHist, rawLabel, 9);
-
-        /* Lock label after several agreeing frames; unlock only on sustained disagreement. */
-        if (tk.lockedLabel.empty()) {
-            if (voted == rawLabel) tk.lockHits++;
-            else tk.lockHits = 0;
-            if (tk.lockHits >= 5) tk.lockedLabel = voted;
-            tk.label = voted;
-        } else {
-            if (voted == tk.lockedLabel) {
-                tk.lockHits = std::min(tk.lockHits + 1, 20);
-                tk.label = tk.lockedLabel;
-            } else {
-                tk.lockHits--;
-                if (tk.lockHits <= 0) {
-                    tk.lockedLabel = voted;
-                    tk.lockHits = 3;
-                    tk.label = voted;
-                } else {
-                    tk.label = tk.lockedLabel;  // hold lock
-                }
-            }
-        }
-
-        tk.isCue = (tk.label == "CUE");
-        tk.isStripe = (tk.label.find("/s") != std::string::npos);
-        /* Paint from locked/voted name. */
-        {
-            bool st = false;
-            std::string base = tk.label;
-            size_t slash = base.find("/s");
-            if (slash != std::string::npos) { base = base.substr(0, slash); st = true; }
-            BallColor bc = BC_UNKNOWN;
-            for (int i = 0; i < (int)BC_COUNT; ++i)
-                if (base == ballColorName((BallColor)i)) { bc = (BallColor)i; break; }
-            tk.bgr = ballColorBgr(bc);
-            tk.isStripe = st || tk.isStripe;
-            (void)st;
-        }
+        auto cl = [](float v) { return (uchar)std::max(0.f, std::min(255.f, v)); };
+        Vec3b avg(cl(tk.hE), cl(tk.sE), cl(tk.vE));
+        classifyHsv(avg, tk.label, tk.isCue, tk.bgr);
         tk.hits++; tk.misses = 0;
     }
 
@@ -888,41 +480,10 @@ void PoolEngine::updateTracks(Analysis &A, cv::Point2f shift)
         nt.id = nextId++;
         nt.pos = D[d].c; nt.radius = D[d].r;
         nt.hE = D[d].hsv[0]; nt.sE = D[d].hsv[1]; nt.vE = D[d].hsv[2];
-        if (D[d].sample.ok) {
-            nt.lE = D[d].sample.lab[0];
-            nt.aE = D[d].sample.lab[1];
-            nt.bE = D[d].sample.lab[2];
-            nt.whiteFracE = D[d].sample.whiteFrac;
-            nt.chromaFracE = D[d].sample.chromaFrac;
-        }
         nt.label = D[d].label; nt.bgr = D[d].bgr; nt.isCue = D[d].isCue;
-        nt.isStripe = D[d].isStripe;
-        nt.labelHist.push_back(D[d].label);
         nt.hits = 1;
         T.push_back(nt);
     }
-
-    /* Whole-game sanity: at most one CUE and one BLACK among confirmed tracks. */
-    auto demoteDupes = [&](const std::string &name) {
-        int best = -1; int bestHits = -1;
-        for (size_t i = 0; i < T.size(); ++i) {
-            if (!T[i].confirmed() || T[i].label != name) continue;
-            if (T[i].hits > bestHits) { bestHits = T[i].hits; best = (int)i; }
-        }
-        if (best < 0) return;
-        for (size_t i = 0; i < T.size(); ++i) {
-            if ((int)i == best || T[i].label != name) continue;
-            /* Force re-evaluate next frames by clearing lock. */
-            T[i].lockedLabel.clear();
-            T[i].lockHits = 0;
-            T[i].labelHist.clear();
-            T[i].isCue = false;
-            T[i].label = "?";
-            T[i].bgr = Scalar(160, 160, 160);
-        }
-    };
-    demoteDupes("CUE");
-    demoteDupes("BLACK");
 }
 
 /* ---- cue stick ---------------------------------------------------------- */
