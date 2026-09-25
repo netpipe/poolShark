@@ -63,6 +63,7 @@
 #include <QPixmap>
 
 #include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/video.hpp>
 #include <opencv2/videoio.hpp>
@@ -71,6 +72,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <map>
 #include <string>
 #include <vector>
@@ -159,27 +161,13 @@ struct ColorSample {
     bool      ok = false;
 };
 
-/* CLAHE on L + mild gray-world WB using felt pixels — reduces glare / uneven light. */
+/* CLAHE on L only. Do not gray-world against the felt: cloth is green, so that
+   boosts red and turns a warm cue into orange/red. */
 static void correctIllumination(cv::Mat &bgr, const cv::Mat &tableMask)
 {
     using namespace cv;
     if (bgr.empty()) return;
-
-    /* Gray-world scale from felt only (skip if mask tiny). */
-    if (!tableMask.empty() && countNonZero(tableMask) > 2000) {
-        Scalar m = mean(bgr, tableMask);
-        double g = (m[0] + m[1] + m[2]) / 3.0;
-        if (g > 8.0) {
-            Mat ch[3];
-            split(bgr, ch);
-            for (int i = 0; i < 3; ++i) {
-                double s = g / std::max(1.0, m[i]);
-                s = std::max(0.75, std::min(1.35, s));   // clamp — felt is green, not gray
-                ch[i].convertTo(ch[i], -1, s, 0);
-            }
-            merge(ch, 3, bgr);
-        }
-    }
+    (void)tableMask;
 
     Mat lab;
     cvtColor(bgr, lab, COLOR_BGR2Lab);
@@ -715,6 +703,7 @@ void PoolEngine::process(const cv::Mat &frameIn, const Params &p, Analysis &A)
     cvtColor(corrected, lab, COLOR_BGR2Lab);
 
     A.shift = estimateMotion(gray, A.tableMask); // head movement compensation
+    A.ballDets.clear();
     detectBalls(hsv, lab, A, p);               // per-frame ball candidates
     updateTracks(A, A.shift);                  // persistent IDs
     A.tracks = tracks;
@@ -736,11 +725,13 @@ void PoolEngine::detectTable(const cv::Mat &hsv, Analysis &A)
 {
     using namespace cv;
     Mat g, b, m;
-    inRange(hsv, Scalar(35, 45, 40), Scalar( 85, 255, 255), g); // green felt
-    inRange(hsv, Scalar(95, 45, 40), Scalar(128, 255, 255), b); // blue felt
+    /* Wide on purpose. A camera pointed at a screen shifts felt toward cyan
+       and washes saturation, which used to leave a jagged hole down one side. */
+    inRange(hsv, Scalar(25, 18, 22), Scalar(100, 255, 255), g);
+    inRange(hsv, Scalar(95, 18, 22), Scalar(130, 255, 255), b);
     m = g | b;
-    morphologyEx(m, m, MORPH_CLOSE, getStructuringElement(MORPH_ELLIPSE, Size(15,15)));
-    morphologyEx(m, m, MORPH_OPEN,  getStructuringElement(MORPH_ELLIPSE, Size(7,7)));
+    morphologyEx(m, m, MORPH_CLOSE, getStructuringElement(MORPH_ELLIPSE, Size(31, 31)));
+    morphologyEx(m, m, MORPH_OPEN,  getStructuringElement(MORPH_ELLIPSE, Size(9, 9)));
 
     std::vector<std::vector<Point>> cs;
     findContours(m, cs, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
@@ -752,10 +743,16 @@ void PoolEngine::detectTable(const cv::Mat &hsv, Analysis &A)
 
     double need = 0.12 * m.total();
     if (bi >= 0 && best > need) {
+        /* Playing surface is convex in perspective. The hull fills glare bites
+           so the far rail and the dim side stay inside the search area. */
+        std::vector<Point> hull;
+        convexHull(cs[bi], hull);
         A.tableMask = Mat::zeros(m.size(), CV_8U);
-        drawContours(A.tableMask, cs, bi, Scalar(255), -1);
-        approxPolyDP(cs[bi], A.tableContour, 10.0, true);
-        Moments mu = moments(cs[bi]);
+        std::vector<std::vector<Point>> hulls{hull};
+        drawContours(A.tableMask, hulls, 0, Scalar(255), FILLED);
+        double eps = std::max(6.0, 0.015 * arcLength(hull, true));
+        approxPolyDP(hull, A.tableContour, eps, true);
+        Moments mu = moments(hull);
         A.tableCenter = (mu.m00 > 0)
             ? Point2f((float)(mu.m10 / mu.m00), (float)(mu.m01 / mu.m00))
             : Point2f(m.cols / 2.f, m.rows / 2.f);
@@ -819,32 +816,50 @@ void PoolEngine::detectBalls(const cv::Mat &hsv, const cv::Mat &lab,
     inRange(hsv, Scalar(8,  25, 170), Scalar( 40, 150, 255), cream);
     inRange(hsv, Scalar(0,  70,  55), Scalar(180, 255, 255), colored);// object balls
     inRange(hsv, Scalar(0,   0,  10), Scalar(180, 180,  85), dark);   // 8-ball
+
+    /* Drop cloth-coloured pixels from the object mask. Saturated felt otherwise
+       becomes one giant blob and real balls never separate. */
+    Mat feltBand = Mat::zeros(hsv.size(), CV_8U);
+    if (A.haveFeltHue) {
+        int lo = (int)std::floor(A.feltHue - 14.f);
+        int hi = (int)std::ceil(A.feltHue + 14.f);
+        auto band = [&](int a, int b) {
+            Mat t;
+            inRange(hsv, Scalar(a, 30, 30), Scalar(b, 255, 255), t);
+            feltBand |= t;
+        };
+        if (lo < 0) { band(0, hi); band(180 + lo, 179); }
+        else if (hi > 179) { band(lo, 179); band(0, hi - 180); }
+        else band(lo, hi);
+        colored.setTo(0, feltBand);
+    }
     m = white | cream | colored | dark;
 
-    /* Lab distance from felt — catches green balls whose hue overlaps cloth.
-       Keep threshold high so purple/magenta felt cast does not spawn ghosts. */
-    if (!A.tableMask.empty() && !lab.empty()) {
+    /* Green balls share the felt hue. Keep them only when they are clearly
+       greener (lower a*) and more saturated than the cloth. */
+    if (!A.tableMask.empty() && !lab.empty() && A.haveFeltHue) {
         Mat feltCore;
         erode(A.tableMask, feltCore, getStructuringElement(MORPH_ELLIPSE, Size(25, 25)));
         if (countNonZero(feltCore) > 800) {
             Scalar fm = mean(lab, feltCore);
-            Mat f32; lab.convertTo(f32, CV_32FC3);
-            std::vector<Mat> ch; split(f32, ch);
-            Mat da = ch[1] - (float)fm[1], db = ch[2] - (float)fm[2];
-            Mat dL = ch[0] - (float)fm[0];
-            Mat dist;
-            sqrt(da.mul(da) + db.mul(db) + 0.15f * dL.mul(dL), dist);
-            Mat far;
-            inRange(dist, 28.0, 200.0, far);
-            /* Only add Lab-far where colour mask already agrees — reduces cloth ghosts. */
-            m |= ((far & (colored | dark | cream)) & A.tableMask);
+            Scalar fs = mean(hsv, feltCore);
+            std::vector<Mat> lch, hsvch;
+            split(lab, lch);
+            split(hsv, hsvch);
+            Mat aCut(lch[1].size(), CV_8U, Scalar((int)std::max(0.0, fm[1] - 14.0)));
+            Mat sCut(hsvch[1].size(), CV_8U, Scalar((int)std::min(255.0, fs[1] + 20.0)));
+            Mat greener, satMore, greenBall;
+            compare(lch[1], aCut, greener, CMP_LT);
+            compare(hsvch[1], sCut, satMore, CMP_GT);
+            bitwise_and(greener, satMore, greenBall);
+            bitwise_and(greenBall, feltBand, greenBall);
+            bitwise_and(greenBall, A.tableMask, greenBall);
+            m |= greenBall;
         }
     }
 
-    /* Prefer interior felt: centres must land on uneroded table, not dilated rails/rack. */
-    Mat tableInner;
-    if (!A.tableMask.empty())
-        erode(A.tableMask, tableInner, getStructuringElement(MORPH_ELLIPSE, Size(11, 11)));
+    /* Centres must lie on the felt. No extra erode, so a ball on the far rail stays in. */
+    Mat tableInner = A.tableMask;
     if (!A.tableMask.empty()) m = m & A.tableMask;
 
     morphologyEx(m, m, MORPH_OPEN,  getStructuringElement(MORPH_RECT,    Size(3,3)));
@@ -868,6 +883,9 @@ void PoolEngine::detectBalls(const cv::Mat &hsv, const cv::Mat &lab,
         }
         /* Magenta/purple cloth fringe */
         if (bc == BC_PURPLE && (S < 90 || samp.chroma < 28.f)) return true;
+        /* Cloth shadow under a ball — dark, still felt-hued. Not an 8-ball. */
+        if (bc == BC_BLACK && dh < 22.f && S >= 25)
+            return true;
         return false;
     };
 
@@ -929,8 +947,10 @@ void PoolEngine::detectBalls(const cv::Mat &hsv, const cv::Mat &lab,
               [](const BallDet &a, const BallDet &b) { return a.fill > b.fill; });
     for (const auto &d : dets) {
         bool dup = false;
-        for (const auto &k : A.ballDets)
-            if (norm(d.c - k.c) < 0.7f * (d.r + k.r)) { dup = true; break; }
+        for (const auto &k : A.ballDets) {
+            float gate = std::max(0.85f * std::max(d.r, k.r), 0.7f * (d.r + k.r));
+            if (norm(d.c - k.c) < gate) { dup = true; break; }
+        }
         if (!dup) A.ballDets.push_back(d);
     }
 }
@@ -1905,8 +1925,36 @@ void MainWindow::closeEvent(QCloseEvent *e)
 
 /* ========================================================================== */
 
+/* Headless still-image check: poolShark --test-image in.jpg out.txt */
+static int runImageTest(const char *inPath, const char *outPath)
+{
+    cv::Mat img = cv::imread(inPath, cv::IMREAD_COLOR);
+    if (img.empty()) return 2;
+    std::ofstream out(outPath);
+    if (!out) return 3;
+
+    PoolEngine eng;
+    Params p;
+    Analysis A;
+    for (int f = 0; f < 6; ++f) {
+        eng.process(img, p, A);
+        out << "FRAME " << f << "\n";
+        for (const auto &d : A.ballDets)
+            out << "DET " << d.label << " " << d.c.x << " " << d.c.y << " " << d.r << "\n";
+        for (const auto &t : A.tracks)
+            out << "TRK " << t.label << " " << t.pos.x << " " << t.pos.y
+                << " hits=" << t.hits << "\n";
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc >= 3 && std::string(argv[1]) == "--test-image") {
+        const char *outp = (argc >= 4) ? argv[3] : "poolshark_test_out.txt";
+        return runImageTest(argv[2], outp);
+    }
+
     QApplication app(argc, argv);
     app.setApplicationName("PoolShark");
     app.setStyle("Fusion");
